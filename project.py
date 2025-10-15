@@ -340,3 +340,195 @@ if __name__ == "__main__":
     workbook_data = extract_xlsx_ordered(filepath, get_desc_fn=desc_fn)
     jpath, mpath = save_as_json_and_md(workbook_data, base)
     print("Saved:", jpath, mpath)
+
+import openpyxl
+from openpyxl.drawing.image import Image as XLImage
+import json
+import os
+from PIL import Image
+from io import BytesIO
+import requests
+
+
+# -------------------- LLaMA Vision Description --------------------
+
+VISION_MODEL_URI = "http://nip1gpu37.sdl.corp.bankofamerica.com:8000/v2/models/meta-llama_Llama-3.2-90B-Vision-Instruct/generate"
+MODEL_NAME = "llama-3.2-90b-vision-instruct"
+
+def get_image_description(image_path):
+    """Get descriptive caption using LLaMA Vision model."""
+    try:
+        with open(image_path, "rb") as image_file:
+            response = requests.post(
+                VISION_MODEL_URI,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": MODEL_NAME,
+                    "messages": [
+                        {"role": "user", "content": "Describe this image. Include any text present in the image."}
+                    ],
+                    "images": [
+                        {
+                            "name": os.path.basename(image_path),
+                            "data": image_file.read().decode("latin1"),
+                        }
+                    ],
+                },
+            )
+        response.raise_for_status()
+        return response.json().get("message", "No description available.")
+    except Exception as e:
+        return f"Error generating description: {e}"
+
+
+# -------------------- Excel Extraction --------------------
+
+def extract_xlsx_content(filepath):
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    workbook_data = {}
+
+    for sheetname in wb.sheetnames:
+        ws = wb[sheetname]
+        sheet_items = []
+
+        # 1️⃣ Extract all images and record their positions
+        images = []
+        for img_idx, image in enumerate(ws._images):
+            if not isinstance(image, XLImage):
+                continue
+
+            img = Image.open(BytesIO(image._data()))
+            os.makedirs("output/images", exist_ok=True)
+            img_path = f"output/images/{sheetname}_img{img_idx+1}.png"
+            img.save(img_path)
+
+            # Get anchor position
+            anchor = getattr(image, "anchor", None)
+            if hasattr(anchor, "from_"):
+                row, col = anchor.from_.row + 1, anchor.from_.col + 1
+            else:
+                row, col = 9999, img_idx  # fallback
+
+            desc = get_image_description(img_path)
+            images.append({
+                "type": "image",
+                "path": img_path,
+                "description": desc,
+                "row": row,
+                "col": col,
+            })
+
+        # 2️⃣ Parse cells row by row (to maintain order)
+        max_col = ws.max_column
+        current_table = []
+        table_start_row = None
+
+        for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            row_values = [cell for cell in row]
+
+            # Check if row has multiple filled cells → likely part of a table
+            non_empty = [c for c in row_values if c not in (None, "")]
+            if len(non_empty) > 1:
+                if not current_table:
+                    table_start_row = row_idx
+                current_table.append(row_values)
+            else:
+                # If a table was ongoing, end it and append
+                if current_table:
+                    sheet_items.append({
+                        "type": "table",
+                        "data": convert_table_to_dict(current_table),
+                        "row": table_start_row,
+                        "col": 1,
+                    })
+                    current_table = []
+
+                # If this row has a single cell of text
+                text_content = non_empty[0] if non_empty else None
+                if text_content:
+                    sheet_items.append({
+                        "type": "text",
+                        "content": str(text_content).strip(),
+                        "row": row_idx,
+                        "col": 1,
+                    })
+
+        # Handle last table if file ends with table
+        if current_table:
+            sheet_items.append({
+                "type": "table",
+                "data": convert_table_to_dict(current_table),
+                "row": table_start_row,
+                "col": 1,
+            })
+
+        # 3️⃣ Merge image items in their order
+        sheet_items.extend(images)
+        # Sort everything by visual position
+        sheet_items.sort(key=lambda x: (x["row"], x["col"]))
+
+        workbook_data[sheetname] = sheet_items
+
+    return workbook_data
+
+
+def convert_table_to_dict(table_rows):
+    """Convert a list of table rows into key-value dict list."""
+    if not table_rows:
+        return []
+
+    headers = [
+        str(h).strip() if h not in (None, "") else f"Column{i+1}"
+        for i, h in enumerate(table_rows[0])
+    ]
+    table_dicts = []
+
+    for row in table_rows[1:]:
+        entry = {}
+        for i, h in enumerate(headers):
+            entry[h] = row[i] if i < len(row) and row[i] is not None else ""
+        table_dicts.append(entry)
+
+    return table_dicts
+
+
+# -------------------- Save JSON + Markdown --------------------
+
+def save_as_json_and_md(workbook_data, base_filename):
+    os.makedirs("output", exist_ok=True)
+    json_path = f"output/{base_filename}.json"
+    md_path = f"output/{base_filename}.md"
+
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(workbook_data, jf, indent=4, ensure_ascii=False)
+
+    with open(md_path, "w", encoding="utf-8") as mf:
+        for sheet, items in workbook_data.items():
+            mf.write(f"# Sheet: {sheet}\n\n")
+            for item in items:
+                if item["type"] == "text":
+                    mf.write(f"{item['content']}\n\n")
+                elif item["type"] == "table":
+                    if not item["data"]:
+                        continue
+                    headers = list(item["data"][0].keys())
+                    mf.write("| " + " | ".join(headers) + " |\n")
+                    mf.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
+                    for row in item["data"]:
+                        mf.write("| " + " | ".join(str(row[h]) for h in headers) + " |\n")
+                    mf.write("\n")
+                elif item["type"] == "image":
+                    mf.write(f"![Image]({item['path']})\n")
+                    mf.write(f"**Description:** {item['description']}\n\n")
+
+    return json_path, md_path
+
+
+# -------------------- Main --------------------
+
+if __name__ == "__main__":
+    filepath = "2024b Online Assessment Package - Vendor, LTD..xlsx"  # your file
+    base_filename = os.path.splitext(os.path.basename(filepath))[0]
+    workbook_data = extract_xlsx_content(filepath)
+    json_file, md_file = save_as_json_and_md(workbook_data, base_filename)
+    print(f"✅ Extraction complete.\nJSON → {json_file}\nMarkdown → {md_file}")
