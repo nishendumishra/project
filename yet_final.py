@@ -489,3 +489,239 @@ if __name__ == "__main__":
     workbook_data = extract_xlsx_content(filepath)
     json_file, md_file = save_as_json_and_md(workbook_data, base_filename)
     print(f"✅ Extraction complete!\nJSON: {json_file}\nMarkdown: {md_file}")
+
+
+
+
+import openpyxl
+from openpyxl.drawing.image import Image as XLImage
+import json
+import os
+from PIL import Image
+from io import BytesIO
+import requests
+import re
+
+VISION_MODEL_URI = "http://nip1gpu37.sdi.corp.bankofamerica.com:8000/v2/models/meta-llama_Llama-3.2-90B-Vision-Instruct/generate"
+MODEL_NAME = "Llama-3.2-90B-Vision-Instruct"
+
+# --------------------- Utility Functions ---------------------
+
+def get_image_description(image_path):
+    """Call the Llama Vision API to describe an image."""
+    try:
+        with open(image_path, "rb") as image_file:
+            image_data = image_file.read()
+            response = requests.post(
+                VISION_MODEL_URI,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "model": MODEL_NAME,
+                    "messages": [{"role": "user", "content": "Describe this image and any text in it."}],
+                    "images": [{
+                        "name": os.path.basename(image_path),
+                        "data": image_data.decode("latin1")
+                    }]
+                }
+            )
+        response.raise_for_status()
+        return response.json().get("message", {}).get("content", "No description available.")
+    except Exception as e:
+        return f"Error generating description: {e}"
+
+def get_image_anchor(image):
+    """Extract anchor (row, col) for an image in Excel."""
+    try:
+        anchor = getattr(image, "anchor", None)
+        if not anchor:
+            return None
+        frm = getattr(anchor, "_from", None) or getattr(anchor, "from_", None) or getattr(anchor, "from", None)
+        if frm:
+            return int(getattr(frm, "row", 0)), int(getattr(frm, "col", 0))
+    except Exception:
+        pass
+    return None
+
+def is_bullet(cell_value):
+    if cell_value is None:
+        return False
+    return bool(re.match(r'^[•\-\*\u2022]\s*', str(cell_value).strip()))
+
+def is_probable_table(rows):
+    if len(rows) < 2:
+        return False
+    non_empty_counts = []
+    bullet_counts = []
+    for row in rows:
+        non_empty = sum(1 for c in row if c and str(c).strip() != "")
+        bullets = sum(1 for c in row if is_bullet(c))
+        non_empty_counts.append(non_empty)
+        bullet_counts.append(bullets)
+    avg_non_empty = sum(non_empty_counts) / len(non_empty_counts)
+    avg_bullets = sum(bullet_counts) / len(bullet_counts)
+    return avg_non_empty >= 2 and not (avg_bullets / max(avg_non_empty, 1) > 0.3)
+
+# --------------------- Core Extraction ---------------------
+
+def extract_images_from_sheet(ws, sheetname, output_dir):
+    """Extract *all* images from a worksheet, even hidden or unanchored ones."""
+    os.makedirs(output_dir, exist_ok=True)
+    images_info = []
+
+    # --- 1️⃣ Try to extract via ws._images (common path) ---
+    if hasattr(ws, "_images"):
+        for idx, img_obj in enumerate(ws._images):
+            try:
+                img_data = img_obj._data()
+            except Exception:
+                img_data = getattr(img_obj, "_data", None)
+            if not img_data:
+                continue
+            img = Image.open(BytesIO(img_data))
+            img_name = f"{sheetname}_image_{idx+1}.png"
+            img_path = os.path.join(output_dir, img_name)
+            img.save(img_path)
+            anchor = get_image_anchor(img_obj)
+            row, col = anchor if anchor else (idx, 0)
+            images_info.append({"type": "image", "path": img_path, "row": row, "col": col})
+    
+    # --- 2️⃣ Fallback: scan relationships for extra drawings ---
+    rels = getattr(ws, "_rels", {})
+    extra_count = len(images_info)
+    for rel in rels.values():
+        try:
+            target = rel.target
+            if "media" in str(target) and hasattr(rel, "target_part"):
+                img_data = rel.target_part.blob
+                img = Image.open(BytesIO(img_data))
+                img_name = f"{sheetname}_extra_image_{extra_count+1}.png"
+                img_path = os.path.join(output_dir, img_name)
+                img.save(img_path)
+                images_info.append({
+                    "type": "image",
+                    "path": img_path,
+                    "row": extra_count,
+                    "col": 0
+                })
+                extra_count += 1
+        except Exception:
+            continue
+
+    return images_info
+
+
+def extract_xlsx_content(filepath):
+    wb = openpyxl.load_workbook(filepath, data_only=True)
+    workbook_data = {}
+
+    for sheetname in wb.sheetnames:
+        ws = wb[sheetname]
+        grid = {}
+        max_row, max_col = ws.max_row, ws.max_column
+        for r in range(1, max_row + 1):
+            for c in range(1, max_col + 1):
+                grid[(r - 1, c - 1)] = ws.cell(row=r, column=c).value
+
+        images_info = extract_images_from_sheet(ws, sheetname, "output_images")
+
+        # Call Vision API for each extracted image
+        for img in images_info:
+            img["description"] = get_image_description(img["path"])
+
+        # ---- Extract text and tables ----
+        items = []
+        r = 0
+        while r < max_row:
+            # Insert images anchored at this row
+            for img in sorted([i for i in images_info if i["row"] == r], key=lambda x: x["col"]):
+                items.append(img)
+
+            row_vals = [grid.get((r, c)) for c in range(max_col)]
+            non_empty_cells = [c for c in range(max_col) if row_vals[c] and str(row_vals[c]).strip() != ""]
+
+            if len(non_empty_cells) > 1:
+                table_rows, start_r = [], r
+                while r < max_row:
+                    row_vals = [grid.get((r, c)) for c in range(max_col)]
+                    if any(row_vals):
+                        table_rows.append(row_vals)
+                        r += 1
+                    else:
+                        break
+
+                if is_probable_table(table_rows):
+                    headers = [str(h) if h else f"Column_{i+1}" for i, h in enumerate(table_rows[0])]
+                    table_dicts = [{h: row[i] for i, h in enumerate(headers)} for row in table_rows[1:]]
+                    items.append({
+                        "type": "table",
+                        "data": table_dicts,
+                        "headers": headers,
+                        "row": start_r,
+                        "col": 0
+                    })
+                else:
+                    for row in table_rows:
+                        text_parts = [str(cell).strip() for cell in row if cell and str(cell).strip()]
+                        if text_parts:
+                            text = " ".join(text_parts)
+                            items.append({"type": "text", "content": text, "row": r, "col": 0})
+            else:
+                text = next((str(cell).strip() for cell in row_vals if cell and str(cell).strip()), None)
+                if text:
+                    items.append({"type": "text", "content": text, "row": r, "col": 0})
+                r += 1
+
+        # Add any remaining unanchored images
+        for img in images_info:
+            if not any(it.get("path") == img["path"] for it in items):
+                items.append(img)
+
+        items_sorted = sorted(items, key=lambda x: (x.get("row", 0), x.get("col", 0)))
+        workbook_data[sheetname] = items_sorted
+
+    return workbook_data
+
+# --------------------- Output Writers ---------------------
+
+def save_as_json_and_md(workbook_data, base_filename):
+    os.makedirs("output", exist_ok=True)
+    json_path = f"output/{base_filename}.json"
+    md_path = f"output/{base_filename}.md"
+
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(workbook_data, jf, indent=4, ensure_ascii=False)
+
+    with open(md_path, "w", encoding="utf-8") as mf:
+        for sheet, items in workbook_data.items():
+            mf.write(f"# Sheet: {sheet}\n\n")
+            for item in items:
+                if item["type"] == "text":
+                    mf.write(f"{item['content']}\n\n")
+                elif item["type"] == "table":
+                    headers = item["headers"]
+                    table = item["data"]
+                    if not headers or not table:
+                        continue
+                    mf.write("| " + " | ".join(headers) + " |\n")
+                    mf.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
+                    for row in table:
+                        mf.write("| " + " | ".join(str(row.get(h, "")) for h in headers) + " |\n")
+                    mf.write("\n")
+                elif item["type"] == "image":
+                    rel = os.path.relpath(item['path'], start=os.path.dirname(md_path))
+                    mf.write(f"![{os.path.basename(item['path'])}]({rel})\n")
+                    mf.write(f"**Description:** {item['description']}\n\n")
+            mf.write("\n---\n\n")
+
+    return json_path, md_path
+
+
+# --------------------- Main ---------------------
+
+if __name__ == "__main__":
+    filepath = "test_excel_with_image.xlsx"  # input Excel
+    base_filename = os.path.splitext(os.path.basename(filepath))[0]
+
+    workbook_data = extract_xlsx_content(filepath)
+    json_file, md_file = save_as_json_and_md(workbook_data, base_filename)
+    print(f"✅ Extraction complete!\nJSON: {json_file}\nMarkdown: {md_file}")
