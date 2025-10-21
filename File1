@@ -1,0 +1,113 @@
+import openpyxl
+from openpyxl.drawing.image import Image as XLImage
+from PIL import Image
+from io import BytesIO
+import os
+import requests
+import re
+
+# === CONFIGURATION ===
+EXCEL_FILE_PATH = "path/to/your/workbook.xlsx"  # <-- set your Excel path
+OUTPUT_DIR = "output"
+IMAGE_DIR = os.path.join(OUTPUT_DIR, "images")
+MD_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "extracted_content.md")
+
+# Your Vision model endpoint
+VISION_MODEL_URI = "http://your-vision-model-endpoint/v2/models/meta-llama_Llama-3.2-90B-Vision-Instruct/generate"
+
+
+# === UTILITIES ===
+def ensure_dirs():
+    os.makedirs(IMAGE_DIR, exist_ok=True)
+
+
+def clean_text(value):
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return re.sub(r'\s+', ' ', text)
+
+
+def call_vision_model(image_path):
+    """Send image to vision model and get description."""
+    with open(image_path, "rb") as f:
+        files = {"file": (os.path.basename(image_path), f, "image/png")}
+        payload = {"prompt": "Describe everything in this image in detail."}
+        try:
+            response = requests.post(VISION_MODEL_URI, data=payload, files=files, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            # Extract model description text
+            description = result.get("result", [{}])[0].get("generated_text", "")
+            return description.strip() or "No description generated."
+        except Exception as e:
+            return f"Error getting description: {e}"
+
+
+def extract_images(ws, sheet_index):
+    """Extract images from worksheet."""
+    images_info = []
+    for i, image in enumerate(ws._images, start=1):
+        img_ref = f"sheet{sheet_index+1}_img{i}.png"
+        image_path = os.path.join(IMAGE_DIR, img_ref)
+
+        # Save image
+        if hasattr(image, "ref"):  # For newer openpyxl versions
+            img = image._data()
+        else:
+            img = image._data()
+
+        im = Image.open(BytesIO(img))
+        im.save(image_path)
+
+        # Get description from Vision model
+        desc = call_vision_model(image_path)
+
+        images_info.append((img_ref, desc))
+    return images_info
+
+
+def extract_text_and_tables(ws):
+    """Extract text and tables in reading order from a worksheet."""
+    data = []
+    for row in ws.iter_rows(values_only=True):
+        row_values = [clean_text(v) for v in row if v is not None]
+        if not any(row_values):
+            continue
+
+        # If row looks like a table (≥2 non-empty columns)
+        if sum(bool(v) for v in row_values) >= 2:
+            data.append("| " + " | ".join(row_values) + " |")
+            data.append("|" + " --- |" * len(row_values))
+        else:
+            data.append(" ".join(row_values))
+    return data
+
+
+def extract_excel_content():
+    ensure_dirs()
+    wb = openpyxl.load_workbook(EXCEL_FILE_PATH)
+    md_lines = [f"# Extracted Content from {os.path.basename(EXCEL_FILE_PATH)}", ""]
+
+    for sheet_index, ws in enumerate(wb.worksheets):
+        md_lines.append(f"\n## Sheet: {ws.title}\n")
+
+        # Extract text and tables
+        md_lines.extend(extract_text_and_tables(ws))
+
+        # Extract images
+        images_info = extract_images(ws, sheet_index)
+        for img_ref, desc in images_info:
+            md_lines.append(f"\n![{img_ref}](images/{img_ref})\n\n**Description:** {desc}\n")
+
+    # Write to markdown
+    with open(MD_OUTPUT_PATH, "w", encoding="utf-8") as f:
+        f.write("\n".join(md_lines))
+
+    print(f"\n✅ Extraction complete!")
+    print(f"Markdown file: {MD_OUTPUT_PATH}")
+    print(f"Images saved in: {IMAGE_DIR}")
+
+
+if __name__ == "__main__":
+    extract_excel_content()
